@@ -1,100 +1,80 @@
-import mercadopago
 import os
-from datetime import datetime, timedelta, timezone
+import mercadopago
+from fastapi import FastAPI, Request
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from supabase import create_client, Client
 
 # 1. Carrega as variáveis
 load_dotenv()
+
+# Configuração Mercado Pago
 TOKEN_MP = os.getenv("MP_ACCESS_TOKEN")
-
 if not TOKEN_MP:
-    raise ValueError("ERRO: Token não encontrado no .env!")
-
-app = FastAPI()
+    raise ValueError("ERRO: Token MP não encontrado!")
 sdk = mercadopago.SDK(TOKEN_MP)
 
-ARQUIVO_IDS = "ids_processados.txt"
+# Configuração Supabase
+URL_SUPABASE = os.getenv("SUPABASE_URL")
+CHAVE_SUPABASE = os.getenv("SUPABASE_KEY")
+if not URL_SUPABASE or not CHAVE_SUPABASE:
+    raise ValueError("ERRO: Credenciais do Supabase não encontradas!")
+supabase: Client = create_client(URL_SUPABASE, CHAVE_SUPABASE)
 
-def carregar_ids_usados():
-    if not os.path.exists(ARQUIVO_IDS):
-        return []
-    with open(ARQUIVO_IDS, "r") as f:
-        return [line.strip() for line in f.readlines()]
+app = FastAPI()
 
-def salvar_id_novo(novo_id):
-    with open(ARQUIVO_IDS, "a") as f:
-        f.write(f"{novo_id}\n")
-
-def buscar_pix_recente():
-    print("\n--- Iniciando busca ---")
-    ids_ja_usados = carregar_ids_usados()
+# ==========================================================
+# ROTA 1: O Mercado Pago avisa aqui quando o PIX cai (Webhook)
+# ==========================================================
+@app.post("/webhook")
+async def receber_webhook(request: Request):
+    dados = await request.json()
     
-    # Busca os últimos 10 pagamentos (IGUAL AO DEBUG)
-    filters = {
-        'sort': 'date_created',
-        'criteria': 'desc',
-        'limit': 10  # Pega os 10 últimos, independente da data
-    }
-    
-    try:
-        resultado = sdk.payment().search(filters)
-        pagamentos = resultado.get("response", {}).get("results", [])
+    # Verifica se a notificação é de pagamento
+    if dados.get("type") == "payment" or dados.get("topic") == "payment":
+        id_pagamento = dados.get("data", {}).get("id")
         
-        if not pagamentos:
-            print("📭 Nenhum pagamento recente encontrado na conta.")
-            return False, None
-
-        # Fuso horário UTC para comparação
-        agora = datetime.now(timezone.utc)
-
-        for pag in pagamentos:
-            pid = str(pag.get("id"))
-            status = pag.get("status")
-            valor = float(pag.get("transaction_amount", 0))
-            data_criacao_str = pag.get("date_created")
+        if id_pagamento:
+            # Segurança: Confirma com o MP se o pagamento é real e foi aprovado
+            resposta = sdk.payment().get(id_pagamento)
+            pagamento = resposta.get("response", {})
             
-            # Converte string do MP para objeto data
-            # O replace resolve o 'Z' que às vezes vem no final
-            data_pag = datetime.fromisoformat(data_criacao_str.replace("Z", "+00:00"))
-            
-            print(f"🔎 Analisando ID {pid} | Status: {status} | Valor: {valor} | Data: {data_criacao_str}")
+            if pagamento.get("status") == "approved":
+                valor = pagamento.get("transaction_amount")
+                
+                # Salva no Banco de Dados!
+                try:
+                    supabase.table("pagamentos").insert({
+                        "id_pix": int(id_pagamento),
+                        "valor": float(valor),
+                        "status": "approved",
+                        "processado": False # Avisa que a bomba ainda não ligou
+                    }).execute()
+                    print(f"✅ PIX Salvo! ID: {id_pagamento} - R$ {valor}")
+                except Exception as e:
+                    # Se der erro, é porque o id_pix já existe (evita duplicidade)
+                    pass
+                    
+    # Responde 200 OK para o Mercado Pago parar de enviar a notificação
+    return {"status": "ok"}
 
-            # 1. Verifica se já foi usado
-            if pid in ids_ja_usados:
-                print(f"   -> ❌ Já processado antes.")
-                continue
 
-            # 2. Verifica se é aprovado
-            if status != 'approved':
-                print(f"   -> ❌ Status não é approved.")
-                continue
-
-            # 3. Verifica o valor (Aceita 2.0 ou 2)
-            if valor != 2.0:
-                print(f"   -> ❌ Valor incorreto (esperado 2.0).")
-                continue
-
-            # 4. Verifica se é recente (últimos 60 minutos)
-            # Se a data do pagamento for maior que (agora - 60min)
-            if data_pag > (agora - timedelta(minutes=60)):
-                print(f"   -> ✅ SUCCESSO! Pagamento válido encontrado.")
-                return True, pid
-            else:
-                print(f"   -> ❌ Muito antigo (mais de 60 min).")
-
-    except Exception as e:
-        print(f"❌ Erro ao consultar Mercado Pago: {e}")
+# ==========================================================
+# ROTA 2: O ESP32 consulta aqui a cada 3 segundos
+# ==========================================================
+@app.get("/verificar_pagamento") # Use o mesmo nome que você colocou no Arduino
+def verificar_pagamento():
+    # Busca 1 pagamento que esteja aprovado e que a bomba ainda não processou
+    resposta = supabase.table("pagamentos").select("*").eq("processado", False).limit(1).execute()
+    
+    # Se achou algum PIX novo...
+    if len(resposta.data) > 0:
+        pagamento = resposta.data[0]
         
-    return False, None
-
-@app.get("/verificar_pagamento")
-def rota_esp32():
-    tem_novo, id_pix = buscar_pix_recente()
-    
-    if tem_novo:
-        print(f"🚀 LIBERANDO BOMBA! ID: {id_pix}")
-        salvar_id_novo(id_pix)
-        return {"ligar": True}
-    
-    return {"ligar": False}
+        # 1. Muda no banco para "processado = True" para não ligar a bomba duas vezes
+        supabase.table("pagamentos").update({"processado": True}).eq("id_pix", pagamento["id_pix"]).execute()
+        
+        # 2. Responde para o ESP32 ligar a bomba!
+        return {"status": "aprovado", "id_pix": pagamento["id_pix"], "valor": pagamento["valor"]}
+        
+    # Se não achou nada, manda o ESP32 esperar
+    return {"status": "pendente"}
