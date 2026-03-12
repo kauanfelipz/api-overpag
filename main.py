@@ -27,34 +27,39 @@ app = FastAPI()
 # ==========================================================
 @app.post("/webhook")
 async def receber_webhook(request: Request):
-    dados = await request.json()
+    # 1. Tenta pegar o ID pela URL (Query Params) - O que está acontecendo na sua foto
+    id_pagamento = request.query_params.get("id")
     
-    # Verifica se a notificação é de pagamento
-    if dados.get("type") == "payment" or dados.get("topic") == "payment":
-        id_pagamento = dados.get("data", {}).get("id")
-        
-        if id_pagamento:
-            # Segurança: Confirma com o MP se o pagamento é real e foi aprovado
-            resposta = sdk.payment().get(id_pagamento)
-            pagamento = resposta.get("response", {})
+    # 2. Se não achou na URL, tenta pegar no corpo da mensagem (JSON)
+    if not id_pagamento:
+        try:
+            dados = await request.json()
+            id_pagamento = dados.get("data", {}).get("id") or dados.get("id")
+        except:
+            pass
+
+    print(f"DEBUG: Tentando processar pagamento ID: {id_pagamento}")
+
+    if id_pagamento:
+        # Segurança: Confirma com o MP se o pagamento é real
+        resposta = sdk.payment().get(id_pagamento)
+        pagamento = resposta.get("response", {})
+
+        if pagamento.get("status") == "approved":
+            valor = pagamento.get("transaction_amount")
             
-            if pagamento.get("status") == "approved":
-                valor = pagamento.get("transaction_amount")
-                
-                # Salva no Banco de Dados!
-                try:
-                    supabase.table("pagamentos").insert({
-                        "id_pix": int(id_pagamento),
-                        "valor": float(valor),
-                        "status": "approved",
-                        "processado": False # Avisa que a bomba ainda não ligou
-                    }).execute()
-                    print(f"✅ PIX Salvo! ID: {id_pagamento} - R$ {valor}")
-                except Exception as e:
-                    # Se der erro, é porque o id_pix já existe (evita duplicidade)
-                    pass
-                    
-    # Responde 200 OK para o Mercado Pago parar de enviar a notificação
+            try:
+                # Salva no Supabase
+                supabase.table("pagamentos").insert({
+                    "id_pix": int(id_pagamento),
+                    "valor": float(valor),
+                    "status": "approved",
+                    "processado": False
+                }).execute()
+                print(f"✅ SUCESSO: PIX {id_pagamento} gravado no Supabase!")
+            except Exception as e:
+                print(f"Aviso: Pagamento já existia ou erro no banco: {e}")
+
     return {"status": "ok"}
 
 
