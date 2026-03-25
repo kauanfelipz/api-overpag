@@ -65,12 +65,25 @@ async def receber_webhook(id_posto: str, request: Request):
 
 
 # =====================================================================
-# ROTA 2: ESP32 PERGUNTA AO SERVIDOR SE TEM PIX NOVO
+# ROTA 2: ESP32 PERGUNTA AO SERVIDOR SE TEM PIX NOVO (AGORA COM TEMPO DINÂMICO)
 # =====================================================================
 @app.get("/verificar_pagamento/{id_maquina}")
 def verificar_pagamento(id_maquina: str):
     try:
-        # 1. Procura PIX não processado APENAS para esta máquina
+        # 1. Pega as configurações de PREÇO e TEMPO dessa máquina específica
+        resposta_posto = supabase.table("postos") \
+            .select("preco_pix, tempo_segundos") \
+            .eq("id_posto", id_maquina) \
+            .execute()
+            
+        if not resposta_posto.data:
+            return {"status": "erro", "mensagem": "Máquina não configurada no banco"}
+            
+        config = resposta_posto.data[0]
+        preco_esperado = config.get("preco_pix", 2.0)
+        tempo_liberado = config.get("tempo_segundos", 240)
+
+        # 2. Procura PIX não processado APENAS para esta máquina
         resposta = supabase.table("pagamentos") \
             .select("*") \
             .eq("processado", False) \
@@ -78,26 +91,40 @@ def verificar_pagamento(id_maquina: str):
             .limit(1) \
             .execute()
         
-        # 2. Se encontrou PIX novo para ela
+        # 3. Se encontrou um PIX novo na fila
         if resposta.data and len(resposta.data) > 0:
             pagamento = resposta.data[0]
+            valor_pago = pagamento["valor"]
             
-            # 3. Marca como "processado = True" para não atracar o relé duas vezes
-            supabase.table("pagamentos") \
-                .update({"processado": True}) \
-                .eq("id_pix", pagamento["id_pix"]) \
-                .execute()
+            # 4. VALIDAÇÃO DE SEGURANÇA: O cliente pagou o valor certo?
+            if valor_pago >= preco_esperado:
+                
+                # Marca como processado para não atracar o relé de novo
+                supabase.table("pagamentos") \
+                    .update({"processado": True}) \
+                    .eq("id_pix", pagamento["id_pix"]) \
+                    .execute()
+                
+                print(f"🚀 BOMBA LIBERADA! Máquina: {id_maquina} | Pagou: R${valor_pago} | Tempo: {tempo_liberado}s")
+                
+                # A MÁGICA ACONTECE AQUI: Devolvemos o tempo exato para o ESP32!
+                return {
+                    "status": "aprovado", 
+                    "tempo_liberado": tempo_liberado
+                }
             
-            print(f"🚀 BOMBA LIBERADA! Máquina: {id_maquina} | Valor: R$ {pagamento['valor']}")
+            else:
+                # Se pagou menos que o esperado (Ex: R$ 0,01), marca como processado para 
+                # tirar da fila, mas NÃO libera a bomba e avisa no painel.
+                supabase.table("pagamentos") \
+                    .update({"processado": True}) \
+                    .eq("id_pix", pagamento["id_pix"]) \
+                    .execute()
+                
+                print(f"⚠️ GOLPE BLOQUEADO! Máquina: {id_maquina} | Pagou R${valor_pago} mas custa R${preco_esperado}")
+                return {"status": "pendente"}
             
-            # 4. Devolve o "aprovado" para o ESP32
-            return {
-                "status": "aprovado", 
-                "id_pix": pagamento["id_pix"], 
-                "valor": pagamento["valor"]
-            }
-            
-        # 5. Se não tem nada novo, manda aguardar
+        # 5. Se não tem nada novo, manda o ESP32 aguardar
         return {"status": "pendente"}
         
     except Exception as e:
