@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 import mercadopago
 from fastapi import FastAPI, Request
@@ -13,7 +14,7 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # =====================================================================
-# ROTA 1: WEBHOOK INTELIGENTE (FORÇA O NOME BONITO DA MÁQUINA)
+# ROTA 1: WEBHOOK INTELIGENTE (COM CARIMBO DE TEMPO ANTI-DUPLICIDADE)
 # =====================================================================
 @app.post("/webhook/{id_conta_principal}")
 async def receber_webhook(id_conta_principal: str, request: Request):
@@ -27,15 +28,12 @@ async def receber_webhook(id_conta_principal: str, request: Request):
             pass
 
     if id_pagamento:
-        # 1. Busca o Token do cliente
         resposta_cliente = supabase.table("postos").select("access_token").eq("id_posto", id_conta_principal).execute()
-        
         if not resposta_cliente.data:
             return {"status": "erro", "mensagem": "Posto desconhecido"}
             
         token_do_cliente = resposta_cliente.data[0]["access_token"]
         
-        # 2. Pergunta ao Mercado Pago os detalhes desse pagamento
         sdk_cliente = mercadopago.SDK(token_do_cliente)
         resposta = sdk_cliente.payment().get(id_pagamento)
         pagamento = resposta.get("response", {})
@@ -43,12 +41,12 @@ async def receber_webhook(id_conta_principal: str, request: Request):
         if pagamento.get("status") == "approved":
             valor = pagamento.get("transaction_amount")
             
-            # A MÁGICA AQUI: Tiramos o 'pos_id' da prioridade. 
-            # Agora ele pega a etiqueta exata 'maquina01' que enviamos na comanda
-            id_maquina_real = pagamento.get("external_reference") or id_conta_principal
+            # Pega o ID bruto (ex: maquina01_1712600000)
+            id_bruto = pagamento.get("external_reference") or id_conta_principal
+            # Corta tudo depois do '_' para o banco de dados e a ESP32 lerem só "maquina01"
+            id_maquina_real = id_bruto.split("_")[0] 
             
             try:
-                # Salva no banco com o nome bonito para a ESP32 achar
                 supabase.table("pagamentos").insert({
                     "id_pix": int(id_pagamento),
                     "valor": float(valor),
@@ -59,19 +57,20 @@ async def receber_webhook(id_conta_principal: str, request: Request):
                 print(f"✅ SUCESSO: PIX de R${valor} na máquina '{id_maquina_real}'!")
                 
                 # ==========================================================
-                # O REARME AUTOMÁTICO
+                # O REARME AUTOMÁTICO TURBINADO
                 # ==========================================================
                 resp_user = requests.get("https://api.mercadopago.com/users/me", headers={"Authorization": f"Bearer {token_do_cliente}"})
                 user_id = resp_user.json().get("id")
                 
                 if user_id:
-                    # O Mercado Pago exige o ID numérico apenas para a URL de rearme
                     pos_id_interno_mp = pagamento.get("pos_id")
-                    
                     url_rearme = f"https://api.mercadopago.com/instore/orders/qr/seller/collectors/{user_id}/pos/{pos_id_interno_mp}/qrs"
                     
+                    # Cria um ID único para o Mercado Pago não chiar (ex: maquina01_1712604593)
+                    id_unico_pedido = f"{id_maquina_real}_{int(time.time())}"
+                    
                     pedido_rearme = {
-                        "external_reference": id_maquina_real, # Mantém a etiqueta bonita para a próxima venda
+                        "external_reference": id_unico_pedido, 
                         "title": "Aspirador Automotivo",
                         "description": "Ficha de 2 Reais para o Aspirador",
                         "expiration_date": "2035-12-31T23:59:59.000-03:00",
@@ -86,8 +85,10 @@ async def receber_webhook(id_conta_principal: str, request: Request):
                             }
                         ]
                     }
-                    requests.put(url_rearme, json=pedido_rearme, headers={"Authorization": f"Bearer {token_do_cliente}"})
-                    print(f"🔄 Máquina '{id_maquina_real}' (ID Interno: {pos_id_interno_mp}) rearmada para o próximo cliente!")
+                    resposta_rearme = requests.put(url_rearme, json=pedido_rearme, headers={"Authorization": f"Bearer {token_do_cliente}"})
+                    
+                    # Agora a gente sabe se o Mercado Pago aceitou ou bloqueou o rearme!
+                    print(f"🔄 Tentativa de rearme (Status {resposta_rearme.status_code}): {resposta_rearme.text}")
                 # ==========================================================
                 
             except Exception as e:
