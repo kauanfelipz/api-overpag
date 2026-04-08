@@ -1,5 +1,6 @@
 fastapi
 uvicorn
-httpx>=0.24.1
+supabase
+mercadopago
 python-dotenv
 requests
