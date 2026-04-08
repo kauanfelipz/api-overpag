@@ -63,10 +63,9 @@ async def receber_webhook(id_conta_principal: str, request: Request):
                 user_id = resp_user.json().get("id")
                 
                 if user_id:
-                    pos_id_interno_mp = pagamento.get("pos_id")
-                    url_rearme = f"https://api.mercadopago.com/instore/orders/qr/seller/collectors/{user_id}/pos/{pos_id_interno_mp}/qrs"
+                    # AQUI FOI A CORREÇÃO: Usamos o id_maquina_real (maquina01) direto na URL
+                    url_rearme = f"https://api.mercadopago.com/instore/orders/qr/seller/collectors/{user_id}/pos/{id_maquina_real}/qrs"
                     
-                    # Cria um ID único para o Mercado Pago não chiar (ex: maquina01_1712604593)
                     id_unico_pedido = f"{id_maquina_real}_{int(time.time())}"
                     
                     pedido_rearme = {
@@ -86,8 +85,6 @@ async def receber_webhook(id_conta_principal: str, request: Request):
                         ]
                     }
                     resposta_rearme = requests.put(url_rearme, json=pedido_rearme, headers={"Authorization": f"Bearer {token_do_cliente}"})
-                    
-                    # Agora a gente sabe se o Mercado Pago aceitou ou bloqueou o rearme!
                     print(f"🔄 Tentativa de rearme (Status {resposta_rearme.status_code}): {resposta_rearme.text}")
                 # ==========================================================
                 
