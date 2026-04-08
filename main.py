@@ -1,4 +1,5 @@
 import os
+import requests 
 import mercadopago
 from fastapi import FastAPI, Request
 from supabase import create_client, Client
@@ -12,7 +13,7 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # =====================================================================
-# ROTA 1: WEBHOOK INTELIGENTE (LÊ A ETIQUETA DA MÁQUINA)
+# ROTA 1: WEBHOOK INTELIGENTE (SALVA O PIX E REARMA A MÁQUINA)
 # =====================================================================
 @app.post("/webhook/{id_conta_principal}")
 async def receber_webhook(id_conta_principal: str, request: Request):
@@ -26,7 +27,7 @@ async def receber_webhook(id_conta_principal: str, request: Request):
             pass
 
     if id_pagamento:
-        # 1. Busca o Token do cliente usando o ID que está na URL do Mercado Pago
+        # 1. Busca o Token do cliente
         resposta_cliente = supabase.table("postos").select("access_token").eq("id_posto", id_conta_principal).execute()
         
         if not resposta_cliente.data:
@@ -41,22 +42,51 @@ async def receber_webhook(id_conta_principal: str, request: Request):
 
         if pagamento.get("status") == "approved":
             valor = pagamento.get("transaction_amount")
-            
-            # O PULO DO GATO: Lê a etiqueta oculta do QR Code (ex: maquina02)
-            # Se por acaso não vier etiqueta, ele salva na máquina principal
             id_maquina_real = pagamento.get("pos_id") or pagamento.get("external_reference") or id_conta_principal
             
             try:
+                # 3. Grava no banco para a ESP32 ler
                 supabase.table("pagamentos").insert({
                     "id_pix": int(id_pagamento),
                     "valor": float(valor),
                     "status": "approved",
                     "processado": False,
-                    "id_maquina": id_maquina_real  # <-- Salva para a máquina exata que o cliente escaneou
+                    "id_maquina": id_maquina_real
                 }).execute()
                 print(f"✅ SUCESSO: PIX de R${valor} na máquina '{id_maquina_real}'!")
+                
+                # ==========================================================
+                # 4. O REARME AUTOMÁTICO (A Mágica da Ficha Infinita)
+                # ==========================================================
+                # Descobre o User ID do dono do posto na hora
+                resp_user = requests.get("https://api.mercadopago.com/users/me", headers={"Authorization": f"Bearer {token_do_cliente}"})
+                user_id = resp_user.json().get("id")
+                
+                if user_id:
+                    url_rearme = f"https://api.mercadopago.com/instore/orders/qr/seller/collectors/{user_id}/pos/{id_maquina_real}/qrs"
+                    
+                    pedido_rearme = {
+                        "external_reference": id_maquina_real,
+                        "title": "Aspirador Automotivo",
+                        "description": "Ficha de 2 Reais para o Aspirador",
+                        "expiration_date": "2035-12-31T23:59:59.000-03:00",
+                        "total_amount": 2.00,
+                        "items": [
+                            {
+                                "title": "Tempo de Aspirador",
+                                "unit_price": 2.00,
+                                "quantity": 1,
+                                "unit_measure": "unit",
+                                "total_amount": 2.00
+                            }
+                        ]
+                    }
+                    requests.put(url_rearme, json=pedido_rearme, headers={"Authorization": f"Bearer {token_do_cliente}"})
+                    print(f"🔄 Máquina '{id_maquina_real}' rearmada para o próximo cliente!")
+                # ==========================================================
+                
             except Exception as e:
-                print(f"Aviso: Erro ao gravar no banco: {e}")
+                print(f"Aviso: Erro ao gravar ou rearmar: {e}")
 
     return {"status": "ok"}
 
