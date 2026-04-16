@@ -5,6 +5,7 @@ import mercadopago
 from fastapi import FastAPI, Request
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
 load_dotenv()
 app = FastAPI()
@@ -12,6 +13,12 @@ app = FastAPI()
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# =====================================================================
+# MODELOS DE DADOS
+# =====================================================================
+class MoedaPayload(BaseModel):
+    valor: float
 
 # =====================================================================
 # ROTA 1: WEBHOOK INTELIGENTE (AGORA COM RASTREADORES)
@@ -85,13 +92,13 @@ async def receber_webhook(id_conta_principal: str, request: Request):
                     
                     pedido_rearme = {
                         "external_reference": id_unico_pedido, 
-                        "title": "Aspirador Automotivo",
-                        "description": "Ficha de 2 Reais para o Aspirador",
+                        "title": "Calibrador Automotivo",
+                        "description": "Ficha de 2 Reais para o Calibrador",
                         "expiration_date": "2035-12-31T23:59:59.000-03:00",
                         "total_amount": 2.00, # <-- Lembre de ajustar para o valor real depois dos testes
                         "items": [
                             {
-                                "title": "Tempo de Aspirador",
+                                "title": "Tempo de Calibrador",
                                 "unit_price": 2.00,
                                 "quantity": 1,
                                 "unit_measure": "unit",
@@ -107,8 +114,9 @@ async def receber_webhook(id_conta_principal: str, request: Request):
                 print(f"❌ ERRO CRÍTICO no banco de dados: {e}")
 
     return {"status": "ok"}
+
 # =====================================================================
-# ROTA 2: ESP32 PERGUNTA AO SERVIDOR
+# ROTA 2: ESP32 PERGUNTA AO SERVIDOR (PIX)
 # =====================================================================
 @app.get("/verificar_pagamento/{id_maquina}")
 def verificar_pagamento(id_maquina: str):
@@ -153,4 +161,30 @@ def verificar_pagamento(id_maquina: str):
         
     except Exception as e:
         print(f"Erro ao verificar máquina {id_maquina}: {e}")
+        return {"status": "erro", "mensagem": str(e)}
+
+# =====================================================================
+# ROTA 3: REGISTRAR MOEDAS FÍSICAS (Vindo da ESP32)
+# =====================================================================
+@app.post("/registrar_moeda/{id_maquina}")
+async def registrar_moeda(id_maquina: str, payload: MoedaPayload):
+    try:
+        # Monta o registro da moeda para o banco de dados
+        # Note que não enviamos "id_pix" porque moedas não geram ID do Mercado Pago
+        dados_moeda = {
+            "id_maquina": id_maquina,
+            "valor": payload.valor,
+            "tipo_pagamento": "moeda",
+            "status": "approved",
+            "processado": True # Já entra como processado pra não liberar a bomba via PIX acidentalmente
+        }
+        
+        # Envia para a tabela 'pagamentos' no Supabase
+        supabase.table("pagamentos").insert(dados_moeda).execute()
+        
+        print(f"🪙 SUCESSO: Moeda de R$ {payload.valor} salva na máquina {id_maquina}!")
+        return {"status": "sucesso", "mensagem": "Moeda gravada com sucesso"}
+
+    except Exception as e:
+        print(f"❌ Erro ao salvar moeda: {e}")
         return {"status": "erro", "mensagem": str(e)}
